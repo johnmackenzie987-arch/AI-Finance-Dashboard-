@@ -367,10 +367,10 @@ def run_stress_test(holdings: pd.DataFrame,
 # 3. GEMINI INTEGRATION (AI Risk Advisor)
 # ---------------------------------------------------------------------------
 
-# Active routing chain: primary model, with automatic fallback when the
-# primary hits 503 UNAVAILABLE or any other API exception.
-GEMINI_MODEL_PRIMARY = "gemini-3.6-flash"
-GEMINI_MODEL_FALLBACK = "gemini-3.1-pro-preview"
+# Active Gemini endpoints, tried in order. A model is skipped (with a
+# user-visible warning) on 503 UNAVAILABLE, 404 NOT_FOUND, quota errors, or
+# any other API exception; the next model in the list is then attempted.
+MODELS_TO_TRY = ["gemini-3.7-flash", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite"]
 
 
 def resolve_gemini_api_key() -> str:
@@ -437,17 +437,18 @@ Cash allocation: {kpis.get('cash_pct', 0):.1f}%
 ## Your task
 Respond in **exactly** this markdown structure (keep the headings verbatim):
 
-### 🔻 3 Key Vulnerabilities
-1. ... (specific to this allocation given current interest rates)
+### 🩺 Portfolio Health Score
+**Score: NN/100** — one-sentence justification.
+
+### 🔻 3 Rate & Allocation Vulnerabilities
+1. ... (specific to this allocation given the interest rates above; quote
+   affected amounts in GBP, £)
 2. ...
 3. ...
 
-### 🔄 2 Concrete Rebalancing Actions
+### 🔄 2 Immediate Rebalancing Recommendations
 1. ... (name specific assets/tickers from the table and target percentages)
 2. ...
-
-### 🩺 Portfolio Health Score
-**Score: NN/100** — one-sentence justification.
 
 Be concise, quantitative where possible, and reference the actual holdings
 and rates provided. Do not add any sections beyond the three above."""
@@ -456,11 +457,11 @@ and rates provided. Do not add any sections beyond the three above."""
 def get_gemini_analysis(api_key: str, prompt: str) -> tuple[str, str]:
     """Call Gemini and return ``(analysis_text, error_message)``.
 
-    Exactly one of the two is non-empty. Attempts ``GEMINI_MODEL_PRIMARY``
-    first; on 503 UNAVAILABLE or any other API exception it notifies the user
-    via ``st.info`` and automatically retries with ``GEMINI_MODEL_FALLBACK``.
-    Import is deferred so the dashboard still runs when `google-genai` is not
-    installed.
+    Exactly one of the two is non-empty. Iterates ``MODELS_TO_TRY`` in order:
+    the first successful generation wins; each failure (503 UNAVAILABLE,
+    404 NOT_FOUND, quota exhaustion, or any other API exception) emits a
+    user-visible warning and falls through to the next model. Import is
+    deferred so the dashboard still runs when `google-genai` is not installed.
     """
     if not api_key:
         return "", "No API key provided."
@@ -471,32 +472,26 @@ def get_gemini_analysis(api_key: str, prompt: str) -> tuple[str, str]:
         return "", ("The `google-genai` package is not installed. "
                     "Run `pip install -r requirements.txt` and restart the app.")
 
-    client = genai.Client(api_key=api_key)
+    client = genai.Client(api_key=api_key.strip())
 
-    def _generate(model: str) -> str:
-        """Run one generation; returns non-empty text or raises."""
-        response = client.models.generate_content(model=model, contents=prompt)
-        text = (response.text or "").strip()
-        if not text:
+    failures: list[str] = []
+    for index, model in enumerate(MODELS_TO_TRY):
+        try:
+            response = client.models.generate_content(model=model, contents=prompt)
+            text = (response.text or "").strip()
+            if text:
+                return text, ""  # success — caller renders the markdown
             raise RuntimeError("model returned an empty response")
-        return text
+        except Exception as exc:  # 503 / 404 / quota / anything else
+            failures.append(f"{model}: {exc}")
+            next_model = (MODELS_TO_TRY[index + 1]
+                          if index + 1 < len(MODELS_TO_TRY) else None)
+            if next_model:
+                st.warning(f"`{model}` unavailable — trying `{next_model}`…",
+                           icon="🔀")
 
-    # --- Primary attempt: gemini-3.6-flash ---------------------------------
-    try:
-        return _generate(GEMINI_MODEL_PRIMARY), ""
-    except Exception as exc:  # 503 UNAVAILABLE, quota, auth, etc.
-        primary_error = exc
-        st.info("Flash busy, routing to Gemini 3.1 Pro...", icon="🔀")
-
-    # --- Fallback attempt: gemini-3.1-pro-preview --------------------------
-    try:
-        return _generate(GEMINI_MODEL_FALLBACK), ""
-    except Exception as exc:
-        return "", (
-            "Gemini API error — both models failed. "
-            f"{GEMINI_MODEL_PRIMARY}: {primary_error} | "
-            f"{GEMINI_MODEL_FALLBACK}: {exc}"
-        )
+    return "", ("Gemini API error — all models failed. "
+                + " | ".join(failures))
 
 
 # ---------------------------------------------------------------------------
@@ -739,9 +734,9 @@ def render_ai_advisor(holdings: pd.DataFrame,
     so it survives unrelated widget reruns.
     """
     st.subheader("✨ AI Risk Advisor · Gemini")
-    st.caption(f"Model: `{GEMINI_MODEL_PRIMARY}` (auto-fallback to "
-               f"`{GEMINI_MODEL_FALLBACK}`) — acts as a senior risk manager "
-               "over your live holdings and macro context.")
+    st.caption(f"Models: `{'` → `'.join(MODELS_TO_TRY)}` (auto-fallback) — "
+               "acts as a senior risk manager over your live £ holdings and "
+               "macro context.")
 
     api_key = resolve_gemini_api_key()
 
