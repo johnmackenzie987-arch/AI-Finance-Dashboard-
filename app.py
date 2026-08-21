@@ -92,7 +92,9 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 # The 5 fields the user enters directly; everything else is computed.
 INPUT_COLUMNS = ["Asset", "Ticker", "Platform", "Asset Class", "Units Owned"]
-ASSET_CLASSES = ["Equities", "Fixed Income", "Crypto", "Cash"]
+ASSET_CLASSES = ["Equities", "Fixed Income", "Crypto", "Cash", "Commodities"]
+PLATFORMS = ["Vanguard", "Trading 212", "Interactive Brokers", "Fidelity",
+             "Hargreaves Lansdown", "Cash/Bank"]
 CASH_TICKER = "CASH"
 HOLDINGS_STATE_KEY = "holdings_input"
 
@@ -108,9 +110,9 @@ def default_holdings_input() -> pd.DataFrame:
         ("Apple",              "AAPL",    "Interactive Brokers", "Equities",      50.0),
         ("US Treasury 1-3Y",   "SHY",     "Fidelity",            "Fixed Income", 400.0),
         ("UK Gilts ETF",       "IGLT.L",  "Hargreaves Lansdown", "Fixed Income", 200.0),
-        ("Bitcoin",            "BTC-USD", "Coinbase",            "Crypto",         0.5),
-        ("Ethereum",           "ETH-USD", "Kraken",              "Crypto",         4.0),
-        ("GBP Cash",           "CASH",    "Barclays",            "Cash",       30_000.0),
+        ("Bitcoin",            "BTC-USD", "Trading 212",         "Crypto",         0.5),
+        ("Ethereum",           "ETH-USD", "Trading 212",         "Crypto",         4.0),
+        ("GBP Cash",           "CASH",    "Cash/Bank",           "Cash",       30_000.0),
     ]
     return pd.DataFrame(rows, columns=INPUT_COLUMNS)
 
@@ -206,6 +208,30 @@ def is_cash_row(ticker: str, asset_class: str) -> bool:
             or str(asset_class).strip() == "Cash")
 
 
+def normalize_input(input_df: pd.DataFrame) -> pd.DataFrame:
+    """Canonicalize a raw 5-column holdings input frame.
+
+    Coerces units to float, strips text fields, and drops blank rows (added
+    in the editor but not yet filled). Used both by the pricing pipeline and
+    by the editor's change detection, so the two always compare like-for-like
+    (identical dtypes and row order) — this is what prevents rerun loops.
+    """
+    if input_df is None or input_df.empty:
+        return pd.DataFrame(columns=INPUT_COLUMNS)
+
+    df = input_df.copy()
+    for col in INPUT_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
+    df["Units Owned"] = pd.to_numeric(df["Units Owned"], errors="coerce").fillna(0.0)
+    for col in ("Asset", "Ticker", "Platform", "Asset Class"):
+        df[col] = df[col].fillna("").astype(str).str.strip()
+
+    df = df[(df["Ticker"] != "") | (df["Asset"] != "")].reset_index(drop=True)
+    return df[INPUT_COLUMNS]
+
+
 def enrich_holdings(input_df: pd.DataFrame) -> pd.DataFrame:
     """Turn the 5-column user input into a fully-priced GBP holdings table.
 
@@ -217,20 +243,7 @@ def enrich_holdings(input_df: pd.DataFrame) -> pd.DataFrame:
     """
     computed_cols = INPUT_COLUMNS + ["Live Price", "Current Value GBP",
                                      "Allocation %", "Price OK"]
-    if input_df is None or input_df.empty:
-        return pd.DataFrame(columns=computed_cols)
-
-    df = input_df.copy()
-    for col in INPUT_COLUMNS:
-        if col not in df.columns:
-            df[col] = None
-
-    df["Units Owned"] = pd.to_numeric(df["Units Owned"], errors="coerce").fillna(0.0)
-    for col in ("Asset", "Ticker", "Platform", "Asset Class"):
-        df[col] = df[col].fillna("").astype(str).str.strip()
-
-    # Drop rows the user added in the editor but hasn't filled in yet.
-    df = df[(df["Ticker"] != "") | (df["Asset"] != "")].reset_index(drop=True)
+    df = normalize_input(input_df)
     if df.empty:
         return pd.DataFrame(columns=computed_cols)
 
@@ -307,10 +320,12 @@ def compute_kpis(holdings: pd.DataFrame) -> dict[str, float]:
     24h P&L is computed from real price deltas: units × (live price − previous
     close), summed over rows that priced successfully.
     """
-    kpis = {"total_value": 0.0, "cash_pct": 0.0, "pnl_24h": 0.0, "pnl_24h_pct": 0.0}
+    kpis = {"total_value": 0.0, "cash_pct": 0.0, "pnl_24h": 0.0,
+            "pnl_24h_pct": 0.0, "num_holdings": 0}
     if holdings is None or holdings.empty:
         return kpis
 
+    kpis["num_holdings"] = int(len(holdings))
     values = pd.to_numeric(holdings.get("Current Value GBP"), errors="coerce").fillna(0)
     total = float(values.sum())
     kpis["total_value"] = total
@@ -353,6 +368,7 @@ def run_stress_test(holdings: pd.DataFrame,
         "Fixed Income": fi_gain,
         "Crypto": max(equity_shock * 1.5, -0.95),
         "Cash": 0.0,
+        "Commodities": equity_shock * 0.5,  # commodities sold off ~half as hard in 2008
     }
 
     df = holdings.copy()
@@ -524,23 +540,28 @@ def render_header() -> None:
 
 
 def render_kpis(kpis: dict[str, float]) -> None:
-    """Top-line KPI metric row."""
-    col1, col2, col3 = st.columns(3)
+    """Top-line visual overview cards."""
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric(
-        "Total Portfolio Value",
+        "💷 Total Portfolio Value",
         f"£{kpis['total_value']:,.2f}",
-        help="Aggregated across all connected platforms, in GBP.",
+        help="Aggregated across all platforms, in GBP.",
     )
     col2.metric(
-        "Cash Allocation",
-        f"{kpis['cash_pct']:.1f}%",
-        help="Money market + bank deposits as % of total.",
-    )
-    col3.metric(
-        "24h P&L",
+        "📈 Total Day Change",
         f"£{kpis['pnl_24h']:+,.2f}",
         delta=f"{kpis['pnl_24h_pct']:+.2f}%",
         help="Units × (live price − previous close) in GBP, summed over priced rows.",
+    )
+    col3.metric(
+        "🧾 Number of Holdings",
+        f"{kpis['num_holdings']:d}",
+        help="Positions currently tracked in the portfolio.",
+    )
+    col4.metric(
+        "💰 Cash Allocation",
+        f"{kpis['cash_pct']:.1f}%",
+        help="Cash balances as % of total portfolio value.",
     )
 
 
@@ -598,85 +619,162 @@ def render_sidebar() -> dict[str, list[dict[str, Any]]]:
     return macro
 
 
-def render_holdings_editor() -> pd.DataFrame:
-    """Editable 5-column holdings input backed by session state.
+def render_add_holding_form() -> None:
+    """Quick 'Add New Stock / Share' form inside a collapsed expander.
 
-    Users enter Asset, Ticker, Platform, Asset Class and Units Owned; rows can
-    be added/deleted directly in the grid. Returns the edited input DataFrame.
+    Appends the new asset to session state on submit; the caller re-enriches
+    afterwards, so valuations recalculate automatically in the same rerun.
     """
-    st.subheader("💼 Holdings")
-    st.caption("Enter your positions below — prices are fetched live from "
-               "Yahoo Finance and converted to GBP (£). Use ticker `CASH` "
-               "(or asset class *Cash*) for cash balances: 1 unit = £1.00.")
+    with st.expander("➕ Add New Stock / Share", expanded=False):
+        with st.form("add_holding_form", clear_on_submit=True, border=False):
+            c1, c2, c3 = st.columns(3)
+            asset_name = c1.text_input(
+                "Asset Name", placeholder="e.g. Apple, Vanguard S&P 500")
+            ticker = c2.text_input(
+                "Ticker", placeholder="e.g. AAPL, VUAG.L, BTC-USD, CASH")
+            platform = c3.selectbox("Platform", PLATFORMS)
 
-    if HOLDINGS_STATE_KEY not in st.session_state:
-        st.session_state[HOLDINGS_STATE_KEY] = default_holdings_input()
+            c4, c5 = st.columns(2)
+            asset_class = c4.selectbox("Asset Class", ASSET_CLASSES)
+            units = c5.number_input(
+                "Units / Shares Owned", min_value=0.0, value=0.0, step=1.0,
+                format="%.4f", help="For CASH rows, enter the GBP amount.")
 
-    if st.button("🔄 Refresh Market Prices",
-                 help="Clears the 60s price cache and refetches all tickers."):
-        fetch_live_price.clear()
+            submitted = st.form_submit_button(
+                "✨ Add to Portfolio", type="primary", width="stretch")
 
-    edited = st.data_editor(
-        st.session_state[HOLDINGS_STATE_KEY],
-        num_rows="dynamic",          # allow adding/deleting rows in the UI
-        width="stretch",
-        hide_index=True,
-        key="holdings_editor",
-        column_config={
-            "Asset": st.column_config.TextColumn(
-                "Asset Name", help="e.g. Apple, S&P 500, Bitcoin, Cash",
-                required=True),
-            "Ticker": st.column_config.TextColumn(
-                "Ticker / Symbol", help="Yahoo Finance symbol, e.g. AAPL, "
-                "VOO, BTC-USD — or CASH for cash", required=True),
-            "Platform": st.column_config.TextColumn(
-                "Platform", help="e.g. Vanguard, IBKR, Fidelity"),
-            "Asset Class": st.column_config.SelectboxColumn(
-                "Asset Class", options=ASSET_CLASSES, required=True),
-            "Units Owned": st.column_config.NumberColumn(
-                "Units Owned", min_value=0.0, format="%.4f",
-                help="Shares / coins held. For CASH rows: GBP amount."),
-        },
-    )
-
-    st.session_state[HOLDINGS_STATE_KEY] = edited
-    return edited
+        if submitted:
+            if not asset_name.strip() or not ticker.strip():
+                st.warning("Please provide both an Asset Name and a Ticker.",
+                           icon="✏️")
+            elif units <= 0:
+                st.warning("Units / Shares Owned must be greater than zero.",
+                           icon="🔢")
+            else:
+                new_row = pd.DataFrame(
+                    [[asset_name.strip(), ticker.strip().upper(),
+                      platform, asset_class, float(units)]],
+                    columns=INPUT_COLUMNS)
+                st.session_state[HOLDINGS_STATE_KEY] = pd.concat(
+                    [normalize_input(st.session_state[HOLDINGS_STATE_KEY]),
+                     new_row], ignore_index=True)
+                st.success(f"Added **{asset_name.strip()}** ({ticker.strip().upper()}) "
+                           "to your portfolio.", icon="✅")
 
 
-def render_holdings_values(holdings: pd.DataFrame) -> None:
-    """Read-only computed view: live prices, market values and allocations."""
+def render_analytics(holdings: pd.DataFrame) -> None:
+    """Visual analytics tab: asset-class donut + platform allocation bars."""
     if holdings is None or holdings.empty:
-        st.info("No holdings entered yet. Add rows above to begin.")
+        st.info("No holdings yet — add your first asset above to see charts.")
         return
 
+    values = pd.to_numeric(holdings["Current Value GBP"], errors="coerce").fillna(0)
+    plot_df = holdings.assign(_value=values)
+    plot_df = plot_df[plot_df["_value"] > 0]
+    if plot_df.empty:
+        st.info("Nothing to chart yet — holdings have no market value.")
+        return
+
+    col_donut, col_bar = st.columns(2)
+
+    with col_donut:
+        st.markdown("**Asset Class Breakdown**")
+        by_class = plot_df.groupby("Asset Class", sort=False)["_value"].sum()
+        donut = go.Figure(go.Pie(
+            labels=by_class.index.tolist(),
+            values=by_class.values.tolist(),
+            hole=0.55,
+            textinfo="label+percent",
+            hovertemplate="%{label}: £%{value:,.2f} (%{percent})<extra></extra>",
+        ))
+        donut.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10),
+                            showlegend=False)
+        st.plotly_chart(donut, width="stretch")
+
+    with col_bar:
+        st.markdown("**Platform Allocation**")
+        by_platform = (plot_df.groupby("Platform", sort=False)["_value"]
+                       .sum().sort_values())
+        bars = go.Figure(go.Bar(
+            x=by_platform.values.tolist(),
+            y=by_platform.index.tolist(),
+            orientation="h",
+            marker_color="#1c83e1",
+            hovertemplate="%{y}: £%{x:,.2f}<extra></extra>",
+        ))
+        bars.update_layout(height=340, margin=dict(l=10, r=10, t=10, b=10),
+                           xaxis_title="Value (£ GBP)")
+        st.plotly_chart(bars, width="stretch")
+
+
+def render_holdings_table(holdings: pd.DataFrame) -> None:
+    """Single interactive grid: in-line editing + live computed GBP columns.
+
+    The 5 input columns are editable (rows can be added or deleted); Live
+    Price, Current Value and Weight are computed and locked. Any change is
+    saved back to session state and immediately re-priced via ``st.rerun``.
+    """
     if not get_usd_to_gbp()["ok"]:
         st.warning("Live GBP/USD rate unavailable — using an approximate "
                    f"fallback of {FALLBACK_USD_TO_GBP:.2f}. USD-quoted values "
                    "may be slightly off.", icon="💱")
 
-    failed = holdings.loc[~holdings["Price OK"].astype(bool), "Ticker"].tolist()
-    if failed:
-        st.warning(f"⚠️ Could not fetch prices for: {', '.join(failed)} — "
-                   "these rows are valued at £0.00. Check the ticker symbols.",
-                   icon="⚠️")
+    if holdings is not None and not holdings.empty:
+        failed = holdings.loc[~holdings["Price OK"].astype(bool), "Ticker"].tolist()
+        if failed:
+            st.warning(f"Could not fetch prices for: {', '.join(failed)} — "
+                       "these rows are valued at £0.00. Check the ticker "
+                       "symbols.", icon="⚠️")
 
-    display = holdings[["Asset", "Ticker", "Platform", "Asset Class",
-                        "Units Owned", "Live Price", "Current Value GBP",
-                        "Allocation %"]]
-    st.dataframe(
+    display_cols = INPUT_COLUMNS + ["Live Price", "Current Value GBP", "Allocation %"]
+    display = (holdings[display_cols] if holdings is not None and not holdings.empty
+               else pd.DataFrame(columns=display_cols))
+
+    # Include any legacy platform/class values so old sessions don't break
+    # the selectbox columns.
+    platform_options = list(dict.fromkeys(
+        PLATFORMS + [p for p in display["Platform"].tolist() if p]))
+    class_options = list(dict.fromkeys(
+        ASSET_CLASSES + [c for c in display["Asset Class"].tolist() if c]))
+
+    edited = st.data_editor(
         display,
+        num_rows="dynamic",          # allow adding/deleting rows in the UI
         width="stretch",
         hide_index=True,
+        key="holdings_editor",
+        disabled=["Live Price", "Current Value GBP", "Allocation %"],
         column_config={
-            "Units Owned": st.column_config.NumberColumn(format="%.4f"),
+            "Asset": st.column_config.TextColumn(
+                "Asset Name", help="e.g. Apple, Vanguard S&P 500",
+                required=True),
+            "Ticker": st.column_config.TextColumn(
+                "Ticker", help="Yahoo Finance symbol, e.g. AAPL, VUAG.L, "
+                "BTC-USD — or CASH for cash", required=True),
+            "Platform": st.column_config.SelectboxColumn(
+                "Platform", options=platform_options),
+            "Asset Class": st.column_config.SelectboxColumn(
+                "Asset Class", options=class_options, required=True),
+            "Units Owned": st.column_config.NumberColumn(
+                "Units / Shares", min_value=0.0, format="%.4f",
+                help="Shares / coins held. For CASH rows: GBP amount."),
             "Live Price": st.column_config.NumberColumn(
                 "Live Price (£)", format="£%.2f"),
             "Current Value GBP": st.column_config.NumberColumn(
-                "Current Value (£)", format="£%,.2f"),
+                "Market Value (£)", format="£%,.2f"),
             "Allocation %": st.column_config.ProgressColumn(
-                "Allocation %", format="%.1f%%", min_value=0, max_value=100),
+                "Weight (%)", format="%.1f%%", min_value=0, max_value=100),
         },
     )
+
+    # Persist in-line edits/deletions and re-price immediately. Both sides
+    # are normalized identically, so this comparison is stable and cannot
+    # trigger a rerun loop.
+    new_input = normalize_input(edited[INPUT_COLUMNS])
+    old_input = normalize_input(st.session_state[HOLDINGS_STATE_KEY])
+    if not new_input.equals(old_input):
+        st.session_state[HOLDINGS_STATE_KEY] = new_input
+        st.rerun()
 
 
 def render_stress_test(holdings: pd.DataFrame) -> None:
@@ -800,18 +898,37 @@ def render_ai_advisor(holdings: pd.DataFrame,
 def main() -> None:
     alerts = get_ai_recommendations()
 
+    if HOLDINGS_STATE_KEY not in st.session_state:
+        st.session_state[HOLDINGS_STATE_KEY] = default_holdings_input()
+
     render_header()
     macro = render_sidebar()  # editable macro rates, fed to the Gemini prompt
 
-    # KPIs must appear above the holdings editor but depend on its edits, so
+    # KPIs must appear above the holdings section but depend on its edits, so
     # reserve the slot now and fill it after the editor has run this rerun.
     kpi_slot = st.container()
     st.divider()
 
-    input_df = render_holdings_editor()
+    st.subheader("💼 Holdings")
+    st.caption("Add stocks & shares below — prices are fetched live from "
+               "Yahoo Finance and converted to GBP (£). Use ticker `CASH` "
+               "(or asset class *Cash*) for cash balances: 1 unit = £1.00.")
+
+    render_add_holding_form()
+
+    if st.button("🔄 Refresh Market Prices",
+                 help="Clears the 60s price cache and refetches all tickers."):
+        fetch_live_price.clear()
+
     with st.spinner("Fetching live market prices…"):
-        holdings = enrich_holdings(input_df)
-    render_holdings_values(holdings)
+        holdings = enrich_holdings(st.session_state[HOLDINGS_STATE_KEY])
+
+    tab_analytics, tab_table = st.tabs(["📊 Visual Analytics", "📋 Holdings Table"])
+    with tab_analytics:
+        render_analytics(holdings)
+    with tab_table:
+        render_holdings_table(holdings)
+
     kpis = compute_kpis(holdings)
     with kpi_slot:
         render_kpis(kpis)
