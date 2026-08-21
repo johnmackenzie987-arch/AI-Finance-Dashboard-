@@ -235,7 +235,10 @@ def run_stress_test(holdings: pd.DataFrame,
 # 3. GEMINI INTEGRATION (AI Risk Advisor)
 # ---------------------------------------------------------------------------
 
-GEMINI_MODEL = "gemini-2.5-pro"
+# Primary model first; each subsequent entry is tried if the previous fails
+# (e.g. model not available on the key's tier, or transient API error).
+GEMINI_MODELS = ("gemini-3.6-flash", "gemini-2.5-flash", "gemini-2.5-pro")
+GEMINI_MODEL = GEMINI_MODELS[0]
 
 
 def resolve_gemini_api_key() -> str:
@@ -320,8 +323,10 @@ and rates provided. Do not add any sections beyond the three above."""
 def get_gemini_analysis(api_key: str, prompt: str) -> tuple[str, str]:
     """Call Gemini and return ``(analysis_text, error_message)``.
 
-    Exactly one of the two is non-empty. Import is deferred so the dashboard
-    still runs when `google-genai` is not installed.
+    Exactly one of the two is non-empty. Tries the models in ``GEMINI_MODELS``
+    order (`gemini-3.6-flash` first, then 2.5 fallbacks) until one succeeds.
+    Import is deferred so the dashboard still runs when `google-genai` is not
+    installed.
     """
     if not api_key:
         return "", "No API key provided."
@@ -332,18 +337,23 @@ def get_gemini_analysis(api_key: str, prompt: str) -> tuple[str, str]:
         return "", ("The `google-genai` package is not installed. "
                     "Run `pip install -r requirements.txt` and restart the app.")
 
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-        )
-        text = (response.text or "").strip()
-        if not text:
-            return "", "Gemini returned an empty response. Please try again."
-        return text, ""
-    except Exception as exc:  # surface API/auth/quota errors to the UI
-        return "", f"Gemini API error: {exc}"
+    client = genai.Client(api_key=api_key)
+
+    errors: list[str] = []
+    for model in GEMINI_MODELS:
+        try:
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+            )
+            text = (response.text or "").strip()
+            if text:
+                return text, ""
+            errors.append(f"{model}: returned an empty response")
+        except Exception as exc:  # API/auth/quota errors — try next model
+            errors.append(f"{model}: {exc}")
+
+    return "", "Gemini API error — all models failed. " + " | ".join(errors)
 
 
 # ---------------------------------------------------------------------------
