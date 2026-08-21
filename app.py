@@ -912,15 +912,18 @@ def main() -> None:
 
     st.subheader("💼 Holdings")
     st.caption("Add stocks & shares below — prices are fetched live from "
-               "Yahoo Finance and converted to GBP (£). Use ticker `CASH` "
+               "Yahoo Finance and converted to GBP (£). Prices update when "
+               "holdings change or you click Refresh. Use ticker `CASH` "
                "(or asset class *Cash*) for cash balances: 1 unit = £1.00.")
 
     render_add_holding_form()
 
     # --- Table management controls -----------------------------------------
     col_refresh, col_clear, col_confirm = st.columns([1.1, 1.1, 1.8])
-    if col_refresh.button("🔄 Refresh Market Prices",
-                          help="Clears the 60s price cache and refetches all tickers."):
+    refresh_clicked = col_refresh.button(
+        "🔄 Refresh Market Prices",
+        help="Clears the price cache and refetches all tickers.")
+    if refresh_clicked:
         fetch_live_price.clear()
 
     confirm_clear = col_confirm.checkbox(
@@ -932,8 +935,20 @@ def main() -> None:
         del st.session_state["confirm_clear"]  # reset the safety checkbox
         st.rerun()
 
-    with st.spinner("Fetching live market prices…"):
-        holdings = enrich_holdings(st.session_state[HOLDINGS_STATE_KEY])
+    # Price snapshot: re-enrich only when holdings change or the user asks
+    # for a refresh. Keeping the priced frame byte-identical between reruns
+    # is essential — st.data_editor resets its pending edit/delete state
+    # whenever its input data changes, so live price ticks mid-edit would
+    # otherwise silently discard the user's row deletions.
+    fingerprint = normalize_input(st.session_state[HOLDINGS_STATE_KEY]).to_json()
+    if (refresh_clicked
+            or "priced_holdings" not in st.session_state
+            or st.session_state.get("priced_fingerprint") != fingerprint):
+        with st.spinner("Fetching live market prices…"):
+            st.session_state["priced_holdings"] = enrich_holdings(
+                st.session_state[HOLDINGS_STATE_KEY])
+        st.session_state["priced_fingerprint"] = fingerprint
+    holdings = st.session_state["priced_holdings"]
 
     if holdings.empty:
         st.info("No holdings yet. Add your first stock/share using the form "
