@@ -2,3 +2,5 @@ streamlit>=1.36
 pandas>=2.0
 plotly>=5.20
 requests>=2.31
+google-genai>=1.0
+tabulate>=0.9  # required by pandas.DataFrame.to_markdown (Gemini prompt building)

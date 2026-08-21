@@ -9,9 +9,11 @@ Structure
 ---------
 1. Configuration & styling ......... page config + lightweight CSS polish
 2. Data layer ...................... mock data providers (swap for live APIs later)
-3. UI components ................... reusable render functions (KPIs, sidebar,
-                                     holdings, stress test, AI feed)
-4. Main ............................ page assembly
+3. Gemini integration .............. API-key resolution, prompt building, and
+                                     the google-genai client call
+4. UI components ................... reusable render functions (KPIs, sidebar,
+                                     holdings, stress test, AI feed, AI advisor)
+5. Main ............................ page assembly
 
 All data-facing functions are defensive: they return safe defaults when data
 is missing or malformed so the UI never crashes on incomplete inputs.
@@ -19,6 +21,7 @@ is missing or malformed so the UI never crashes on incomplete inputs.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import pandas as pd
@@ -76,6 +79,20 @@ CUSTOM_CSS = """
     .ai-alert .severity { font-size: 0.72rem; font-weight: 700;
                           text-transform: uppercase; letter-spacing: 0.05em; }
     .ai-alert .msg { font-size: 0.88rem; margin-top: 2px; }
+
+    /* Gemini AI Risk Advisor response card */
+    .advisor-card {
+        background: linear-gradient(135deg, rgba(66, 133, 244, 0.08),
+                                            rgba(156, 39, 176, 0.06));
+        border: 1px solid rgba(66, 133, 244, 0.30);
+        border-radius: 12px;
+        padding: 18px 22px;
+        margin-top: 8px;
+    }
+    .advisor-card .advisor-header {
+        font-size: 0.75rem; font-weight: 700; text-transform: uppercase;
+        letter-spacing: 0.06em; opacity: 0.7; margin-bottom: 8px;
+    }
 </style>
 """
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
@@ -215,7 +232,122 @@ def run_stress_test(holdings: pd.DataFrame,
 
 
 # ---------------------------------------------------------------------------
-# 3. UI COMPONENTS
+# 3. GEMINI INTEGRATION (AI Risk Advisor)
+# ---------------------------------------------------------------------------
+
+GEMINI_MODEL = "gemini-2.5-pro"
+
+
+def resolve_gemini_api_key() -> str:
+    """Resolve the Gemini API key from (in priority order):
+
+    1. `GEMINI_API_KEY` environment variable (works with .env via `dotenv`
+       or an exported shell variable),
+    2. Streamlit secrets (`.streamlit/secrets.toml`),
+    3. the session value entered in the sidebar password field.
+
+    Returns an empty string when no key is configured anywhere.
+    """
+    env_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    try:  # st.secrets raises if no secrets file exists at all
+        secret_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+        if secret_key:
+            return secret_key
+    except Exception:
+        pass
+
+    return str(st.session_state.get("gemini_api_key_input", "")).strip()
+
+
+def build_risk_prompt(holdings: pd.DataFrame,
+                      kpis: dict[str, float],
+                      macro: dict[str, list[dict[str, Any]]]) -> str:
+    """Serialize portfolio + macro context into a structured Gemini prompt.
+
+    The model is instructed to respond in fixed markdown sections so the UI
+    can render the output predictably.
+    """
+    holdings_block = (
+        holdings.to_markdown(index=False)
+        if holdings is not None and not holdings.empty
+        else "(no holdings data available)"
+    )
+
+    macro_lines: list[str] = []
+    for region, indicators in (macro or {}).items():
+        for ind in indicators:
+            macro_lines.append(
+                f"- {region} {ind.get('name', '?')}: {ind.get('value', '?')} "
+                f"({ind.get('delta', 'n/a')})"
+            )
+    macro_block = "\n".join(macro_lines) or "(no macro data available)"
+
+    return f"""You are a senior portfolio risk manager at a global asset manager.
+Analyze the client portfolio below in the context of the current macroeconomic
+rate environment.
+
+## Portfolio holdings
+{holdings_block}
+
+Total portfolio value: ${kpis.get('total_value', 0):,.0f}
+Cash allocation: {kpis.get('cash_pct', 0):.1f}%
+
+## Current macro rates
+{macro_block}
+
+## Your task
+Respond in **exactly** this markdown structure (keep the headings verbatim):
+
+### 🔻 3 Key Vulnerabilities
+1. ... (specific to this allocation given current interest rates)
+2. ...
+3. ...
+
+### 🔄 2 Concrete Rebalancing Actions
+1. ... (name specific assets/tickers from the table and target percentages)
+2. ...
+
+### 🩺 Portfolio Health Score
+**Score: NN/100** — one-sentence justification.
+
+Be concise, quantitative where possible, and reference the actual holdings
+and rates provided. Do not add any sections beyond the three above."""
+
+
+def get_gemini_analysis(api_key: str, prompt: str) -> tuple[str, str]:
+    """Call Gemini and return ``(analysis_text, error_message)``.
+
+    Exactly one of the two is non-empty. Import is deferred so the dashboard
+    still runs when `google-genai` is not installed.
+    """
+    if not api_key:
+        return "", "No API key provided."
+
+    try:
+        from google import genai
+    except ImportError:
+        return "", ("The `google-genai` package is not installed. "
+                    "Run `pip install -r requirements.txt` and restart the app.")
+
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+        )
+        text = (response.text or "").strip()
+        if not text:
+            return "", "Gemini returned an empty response. Please try again."
+        return text, ""
+    except Exception as exc:  # surface API/auth/quota errors to the UI
+        return "", f"Gemini API error: {exc}"
+
+
+# ---------------------------------------------------------------------------
+# 4. UI COMPONENTS
 # ---------------------------------------------------------------------------
 
 def render_header() -> None:
@@ -272,6 +404,23 @@ def render_sidebar(macro: dict[str, list[dict[str, Any]]]) -> None:
                     """,
                     unsafe_allow_html=True,
                 )
+
+        st.divider()
+
+        # --- Gemini API key (only ask if not already set via env/secrets) ---
+        st.header("🔑 Gemini API")
+        if os.environ.get("GEMINI_API_KEY", "").strip():
+            st.success("API key loaded from environment.", icon="✅")
+        else:
+            st.text_input(
+                "GEMINI_API_KEY",
+                type="password",
+                key="gemini_api_key_input",
+                help="Stored only in this session. Alternatively set the "
+                     "GEMINI_API_KEY environment variable or add it to "
+                     ".streamlit/secrets.toml.",
+                placeholder="Paste your Gemini API key",
+            )
 
         st.divider()
         st.caption("Data refresh: every 5 min (cached) · All figures indicative.")
@@ -361,18 +510,66 @@ def render_ai_feed(alerts: list[dict[str, str]]) -> None:
     st.caption("Alerts are illustrative — generated by mock rules engine.")
 
 
+def render_ai_advisor(holdings: pd.DataFrame,
+                      kpis: dict[str, float],
+                      macro: dict[str, list[dict[str, Any]]]) -> None:
+    """Gemini-powered AI Risk Advisor panel.
+
+    Sends holdings, total value, and macro rates to Gemini on demand and
+    renders the structured analysis (vulnerabilities, rebalancing actions,
+    health score) in a styled card. The last result is kept in session state
+    so it survives unrelated widget reruns.
+    """
+    st.subheader("✨ AI Risk Advisor · Gemini")
+    st.caption(f"Model: `{GEMINI_MODEL}` — acts as a senior risk manager over "
+               "your live holdings and macro context.")
+
+    api_key = resolve_gemini_api_key()
+
+    clicked = st.button(
+        "🔎 Analyze Portfolio & Macro Risk with Gemini",
+        type="primary",
+        disabled=not api_key,
+        help=None if api_key else "Enter your GEMINI_API_KEY in the sidebar first.",
+    )
+    if not api_key:
+        st.info("Add your Gemini API key in the sidebar (🔑 Gemini API) to "
+                "enable the advisor.", icon="🔑")
+
+    if clicked:
+        prompt = build_risk_prompt(holdings, kpis, macro)
+        with st.spinner("Gemini is analyzing your portfolio and macro exposure…"):
+            analysis, error = get_gemini_analysis(api_key, prompt)
+        st.session_state["advisor_analysis"] = analysis
+        st.session_state["advisor_error"] = error
+
+    error = st.session_state.get("advisor_error", "")
+    analysis = st.session_state.get("advisor_analysis", "")
+
+    if error:
+        st.error(error, icon="⚠️")
+    elif analysis:
+        st.markdown('<div class="advisor-card">'
+                    '<div class="advisor-header">Gemini Risk Analysis</div>'
+                    '</div>', unsafe_allow_html=True)
+        with st.container(border=True):
+            st.markdown(analysis)
+        st.caption("AI-generated analysis — informational only, not financial advice.")
+
+
 # ---------------------------------------------------------------------------
-# 4. MAIN
+# 5. MAIN
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     holdings = get_holdings()
     macro = get_macro_rates()
     alerts = get_ai_recommendations()
+    kpis = compute_kpis(holdings)
 
     render_header()
     render_sidebar(macro)
-    render_kpis(compute_kpis(holdings))
+    render_kpis(kpis)
     st.divider()
 
     render_holdings(holdings)
@@ -384,6 +581,9 @@ def main() -> None:
         render_stress_test(holdings)
     with right:
         render_ai_feed(alerts)
+
+    st.divider()
+    render_ai_advisor(holdings, kpis, macro)
 
 
 if __name__ == "__main__":
