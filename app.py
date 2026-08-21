@@ -99,22 +99,18 @@ CASH_TICKER = "CASH"
 HOLDINGS_STATE_KEY = "holdings_input"
 
 
-def default_holdings_input() -> pd.DataFrame:
-    """Seed portfolio for first load — Yahoo-Finance-valid tickers so live
-    pricing works out of the box. USD assets are auto-converted to GBP; the
-    `.L` ticker demonstrates native pence (GBp) handling. Cash units = GBP.
+def empty_holdings_input() -> pd.DataFrame:
+    """Empty starting portfolio — the user adds every position themselves
+    (via the Add form or directly in the table). No dummy data is seeded.
+    Columns carry proper dtypes so the data editor renders correctly.
     """
-    rows = [
-        ("S&P 500 ETF",        "VOO",     "Vanguard",            "Equities",     120.0),
-        ("Nasdaq 100 ETF",     "QQQ",     "Interactive Brokers", "Equities",      80.0),
-        ("Apple",              "AAPL",    "Interactive Brokers", "Equities",      50.0),
-        ("US Treasury 1-3Y",   "SHY",     "Fidelity",            "Fixed Income", 400.0),
-        ("UK Gilts ETF",       "IGLT.L",  "Hargreaves Lansdown", "Fixed Income", 200.0),
-        ("Bitcoin",            "BTC-USD", "Trading 212",         "Crypto",         0.5),
-        ("Ethereum",           "ETH-USD", "Trading 212",         "Crypto",         4.0),
-        ("GBP Cash",           "CASH",    "Cash/Bank",           "Cash",       30_000.0),
-    ]
-    return pd.DataFrame(rows, columns=INPUT_COLUMNS)
+    return pd.DataFrame({
+        "Asset": pd.Series(dtype="str"),
+        "Ticker": pd.Series(dtype="str"),
+        "Platform": pd.Series(dtype="str"),
+        "Asset Class": pd.Series(dtype="str"),
+        "Units Owned": pd.Series(dtype="float"),
+    })
 
 
 @st.cache_data(ttl=60, show_spinner=False)
@@ -665,7 +661,7 @@ def render_add_holding_form() -> None:
 def render_analytics(holdings: pd.DataFrame) -> None:
     """Visual analytics tab: asset-class donut + platform allocation bars."""
     if holdings is None or holdings.empty:
-        st.info("No holdings yet — add your first asset above to see charts.")
+        st.info("Charts will appear once you add holdings.", icon="📊")
         return
 
     values = pd.to_numeric(holdings["Current Value GBP"], errors="coerce").fillna(0)
@@ -727,8 +723,13 @@ def render_holdings_table(holdings: pd.DataFrame) -> None:
                        "symbols.", icon="⚠️")
 
     display_cols = INPUT_COLUMNS + ["Live Price", "Current Value GBP", "Allocation %"]
-    display = (holdings[display_cols] if holdings is not None and not holdings.empty
-               else pd.DataFrame(columns=display_cols))
+    if holdings is not None and not holdings.empty:
+        display = holdings[display_cols]
+    else:
+        # Empty grid with correct dtypes so users can type rows in directly.
+        display = empty_holdings_input()
+        for col in ("Live Price", "Current Value GBP", "Allocation %"):
+            display[col] = pd.Series(dtype="float")
 
     # Include any legacy platform/class values so old sessions don't break
     # the selectbox columns.
@@ -899,7 +900,7 @@ def main() -> None:
     alerts = get_ai_recommendations()
 
     if HOLDINGS_STATE_KEY not in st.session_state:
-        st.session_state[HOLDINGS_STATE_KEY] = default_holdings_input()
+        st.session_state[HOLDINGS_STATE_KEY] = empty_holdings_input()
 
     render_header()
     macro = render_sidebar()  # editable macro rates, fed to the Gemini prompt
@@ -916,12 +917,27 @@ def main() -> None:
 
     render_add_holding_form()
 
-    if st.button("🔄 Refresh Market Prices",
-                 help="Clears the 60s price cache and refetches all tickers."):
+    # --- Table management controls -----------------------------------------
+    col_refresh, col_clear, col_confirm = st.columns([1.1, 1.1, 1.8])
+    if col_refresh.button("🔄 Refresh Market Prices",
+                          help="Clears the 60s price cache and refetches all tickers."):
         fetch_live_price.clear()
+
+    confirm_clear = col_confirm.checkbox(
+        "Confirm wipe", key="confirm_clear",
+        help="Tick this first to enable the Clear All button.")
+    if col_clear.button("🗑️ Clear All Holdings", disabled=not confirm_clear,
+                        help="Removes every holding from this session."):
+        st.session_state[HOLDINGS_STATE_KEY] = empty_holdings_input()
+        del st.session_state["confirm_clear"]  # reset the safety checkbox
+        st.rerun()
 
     with st.spinner("Fetching live market prices…"):
         holdings = enrich_holdings(st.session_state[HOLDINGS_STATE_KEY])
+
+    if holdings.empty:
+        st.info("No holdings yet. Add your first stock/share using the form "
+                "above or enter directly into the table.", icon="👋")
 
     tab_analytics, tab_table = st.tabs(["📊 Visual Analytics", "📋 Holdings Table"])
     with tab_analytics:
