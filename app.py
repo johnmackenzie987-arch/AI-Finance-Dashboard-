@@ -40,8 +40,8 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Minimal CSS polish: tightens metric cards, styles the macro rate cards and
-# the AI alert feed without fighting Streamlit's native theme.
+# Minimal CSS polish: tightens metric cards and styles the AI alert feed
+# without fighting Streamlit's native theme.
 CUSTOM_CSS = """
 <style>
     /* KPI metric cards */
@@ -51,20 +51,6 @@ CUSTOM_CSS = """
         border-radius: 12px;
         padding: 14px 18px;
     }
-
-    /* Sidebar macro rate cards */
-    .macro-card {
-        background: rgba(255, 255, 255, 0.04);
-        border: 1px solid rgba(128, 128, 128, 0.25);
-        border-radius: 10px;
-        padding: 10px 14px;
-        margin-bottom: 8px;
-    }
-    .macro-card .label { font-size: 0.78rem; opacity: 0.7; }
-    .macro-card .value { font-size: 1.15rem; font-weight: 700; }
-    .macro-card .delta { font-size: 0.75rem; }
-    .delta-up   { color: #e45756; }   /* rising rates/inflation = risk tone */
-    .delta-down { color: #54a24b; }
 
     /* AI recommendation feed */
     .ai-alert {
@@ -111,18 +97,19 @@ HOLDINGS_STATE_KEY = "holdings_input"
 
 
 def default_holdings_input() -> pd.DataFrame:
-    """Seed portfolio for first load — Yahoo-Finance-valid, USD-denominated
-    tickers so live pricing works out of the box. Cash rows use units = USD.
+    """Seed portfolio for first load — Yahoo-Finance-valid tickers so live
+    pricing works out of the box. USD assets are auto-converted to GBP; the
+    `.L` ticker demonstrates native pence (GBp) handling. Cash units = GBP.
     """
     rows = [
         ("S&P 500 ETF",        "VOO",     "Vanguard",            "Equities",     120.0),
         ("Nasdaq 100 ETF",     "QQQ",     "Interactive Brokers", "Equities",      80.0),
         ("Apple",              "AAPL",    "Interactive Brokers", "Equities",      50.0),
         ("US Treasury 1-3Y",   "SHY",     "Fidelity",            "Fixed Income", 400.0),
-        ("Corp IG Bond Fund",  "LQD",     "Fidelity",            "Fixed Income", 250.0),
+        ("UK Gilts ETF",       "IGLT.L",  "Hargreaves Lansdown", "Fixed Income", 200.0),
         ("Bitcoin",            "BTC-USD", "Coinbase",            "Crypto",         0.5),
         ("Ethereum",           "ETH-USD", "Kraken",              "Crypto",         4.0),
-        ("USD Cash",           "CASH",    "Vanguard",            "Cash",       40_000.0),
+        ("GBP Cash",           "CASH",    "Barclays",            "Cash",       30_000.0),
     ]
     return pd.DataFrame(rows, columns=INPUT_COLUMNS)
 
@@ -131,12 +118,13 @@ def default_holdings_input() -> pd.DataFrame:
 def fetch_live_price(ticker: str) -> dict[str, Any]:
     """Fetch the live price (and previous close) for one ticker via yfinance.
 
-    Returns ``{"price": float, "prev_close": float, "ok": bool}``. Cached for
-    60s so table edits and reruns stay fast. Any failure (bad ticker, network
-    down, delisted symbol) degrades to price 0.0 with ``ok=False`` — callers
-    flag the row instead of crashing.
+    Returns ``{"price": float, "prev_close": float, "currency": str, "ok": bool}``
+    in the asset's *native* quote currency (currency conversion happens in
+    :func:`enrich_holdings`). Cached for 60s so table edits and reruns stay
+    fast. Any failure (bad ticker, network down, delisted symbol) degrades to
+    price 0.0 with ``ok=False`` — callers flag the row instead of crashing.
     """
-    result = {"price": 0.0, "prev_close": 0.0, "ok": False}
+    result = {"price": 0.0, "prev_close": 0.0, "currency": "USD", "ok": False}
     ticker = (ticker or "").strip().upper()
     if not ticker:
         return result
@@ -152,6 +140,9 @@ def fetch_live_price(ticker: str) -> dict[str, Any]:
             fast = asset.fast_info
             price = float(fast["last_price"] or 0.0)
             prev_close = float(fast["previous_close"] or 0.0)
+            # NB: keep the exact case — Yahoo uses "GBp" for pence quotes,
+            # which must not be confused with "GBP".
+            result["currency"] = str(fast["currency"] or "USD")
         except Exception:
             pass
 
@@ -174,20 +165,56 @@ def fetch_live_price(ticker: str) -> dict[str, Any]:
     return result
 
 
+# Used only if the live GBP/USD quote cannot be fetched (approximate rate).
+FALLBACK_USD_TO_GBP = 0.79
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def get_usd_to_gbp() -> dict[str, Any]:
+    """Return ``{"rate": USD→GBP multiplier, "ok": bool}``.
+
+    Derived from the live ``GBPUSD=X`` quote (USD per 1 GBP). Falls back to
+    an approximate constant when the FX feed is unavailable so the dashboard
+    keeps working — callers surface a warning when ``ok`` is False.
+    """
+    quote = fetch_live_price("GBPUSD=X")
+    if quote["ok"] and quote["price"] > 0:
+        return {"rate": 1.0 / quote["price"], "ok": True}
+    return {"rate": FALLBACK_USD_TO_GBP, "ok": False}
+
+
+def convert_to_gbp(amount: float, currency: str, usd_to_gbp: float) -> float:
+    """Convert an amount from its native quote currency into GBP (£).
+
+    - ``GBp`` / ``GBX`` (LSE pence quotes) → divide by 100.
+    - ``GBP``                              → unchanged.
+    - ``USD`` and anything else            → multiply by the USD→GBP rate
+      (non-USD majors are approximated via the USD leg for simplicity).
+    """
+    raw = str(currency or "USD")
+    if raw == "GBp" or raw.upper() == "GBX":
+        return amount / 100.0
+    if raw.upper() == "GBP":
+        return amount
+    return amount * usd_to_gbp
+
+
 def is_cash_row(ticker: str, asset_class: str) -> bool:
-    """Cash rows are priced at a locked $1.00 (units == USD)."""
+    """Cash rows are priced at a locked £1.00 (units == GBP)."""
     return (str(ticker).strip().upper() == CASH_TICKER
             or str(asset_class).strip() == "Cash")
 
 
 def enrich_holdings(input_df: pd.DataFrame) -> pd.DataFrame:
-    """Turn the 5-column user input into a fully-priced holdings table.
+    """Turn the 5-column user input into a fully-priced GBP holdings table.
 
-    Adds: Live Price, Current Value USD (= units × price), Allocation %, and
-    a Price OK flag for rows whose ticker failed to price. Blank rows (added
-    but not yet filled in the editor) are dropped. Never raises.
+    Native quotes are converted to £ (USD via the live GBP/USD rate; LSE
+    pence quotes divided by 100). Adds: Live Price (£), Current Value GBP
+    (= units × price), Allocation %, and a Price OK flag for rows whose
+    ticker failed to price. Blank rows (added but not yet filled in the
+    editor) are dropped. Never raises.
     """
-    computed_cols = INPUT_COLUMNS + ["Live Price", "Current Value USD",
+    computed_cols = INPUT_COLUMNS + ["Live Price", "Current Value GBP",
                                      "Allocation %", "Price OK"]
     if input_df is None or input_df.empty:
         return pd.DataFrame(columns=computed_cols)
@@ -206,6 +233,8 @@ def enrich_holdings(input_df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=computed_cols)
 
+    usd_to_gbp = get_usd_to_gbp()["rate"]
+
     prices, prev_closes, ok_flags = [], [], []
     for _, row in df.iterrows():
         if is_cash_row(row["Ticker"], row["Asset Class"]):
@@ -214,41 +243,36 @@ def enrich_holdings(input_df: pd.DataFrame) -> pd.DataFrame:
             ok_flags.append(True)
         else:
             quote = fetch_live_price(row["Ticker"])
-            prices.append(quote["price"])
-            prev_closes.append(quote["prev_close"])
+            prices.append(convert_to_gbp(quote["price"], quote["currency"], usd_to_gbp))
+            prev_closes.append(convert_to_gbp(quote["prev_close"], quote["currency"], usd_to_gbp))
             ok_flags.append(quote["ok"])
 
     df["Live Price"] = prices
     df["Prev Close"] = prev_closes
     df["Price OK"] = ok_flags
-    df["Current Value USD"] = df["Units Owned"] * df["Live Price"]
+    df["Current Value GBP"] = df["Units Owned"] * df["Live Price"]
 
-    total = float(df["Current Value USD"].sum())
-    df["Allocation %"] = (100.0 * df["Current Value USD"] / total) if total > 0 else 0.0
+    total = float(df["Current Value GBP"].sum())
+    df["Allocation %"] = (100.0 * df["Current Value GBP"] / total) if total > 0 else 0.0
     return df
 
 
-@st.cache_data(ttl=300)
-def get_macro_rates() -> dict[str, list[dict[str, Any]]]:
-    """Return placeholder macroeconomic indicators grouped by region.
-
-    Each entry: name, value (display string), delta (bps/pp change) and
-    direction ("up"/"down"/"flat"). Swap for FRED / BoE / ECB API calls later.
-    """
-    return {
-        "🇺🇸 United States": [
-            {"name": "SOFR",            "value": "5.31%", "delta": "+1bp MoM",  "direction": "up"},
-            {"name": "Fed Funds Rate",  "value": "5.25–5.50%", "delta": "unchanged", "direction": "flat"},
-        ],
-        "🇬🇧 United Kingdom": [
-            {"name": "BoE Base Rate",   "value": "5.00%", "delta": "-25bps last MPC", "direction": "down"},
-            {"name": "CPI (YoY)",       "value": "2.2%",  "delta": "+0.2pp MoM", "direction": "up"},
-        ],
-        "🇪🇺 Euro Area": [
-            {"name": "ECB Deposit Rate", "value": "3.75%", "delta": "-25bps last meeting", "direction": "down"},
-            {"name": "HICP (YoY)",       "value": "2.6%",  "delta": "+0.1pp MoM", "direction": "up"},
-        ],
-    }
+# Benchmark macro defaults (editable in the sidebar). Each indicator has a
+# stable session-state key so manual adjustments persist across reruns.
+MACRO_DEFAULTS: dict[str, list[dict[str, Any]]] = {
+    "🇬🇧 United Kingdom": [
+        {"name": "BoE Base Rate",             "key": "macro_uk_boe",  "value": 3.75},
+        {"name": "UK CPI (YoY)",              "key": "macro_uk_cpi",  "value": 2.60},
+    ],
+    "🇺🇸 United States": [
+        {"name": "SOFR",                      "key": "macro_us_sofr", "value": 3.62},
+        {"name": "Fed Funds Rate (upper)",    "key": "macro_us_ffr",  "value": 3.75},
+    ],
+    "🇪🇺 Euro Area": [
+        {"name": "ECB Deposit Facility Rate", "key": "macro_eu_ecb",  "value": 2.25},
+        {"name": "Eurozone HICP (YoY)",       "key": "macro_eu_hicp", "value": 2.20},
+    ],
+}
 
 
 @st.cache_data(ttl=300)
@@ -286,7 +310,7 @@ def compute_kpis(holdings: pd.DataFrame) -> dict[str, float]:
     if holdings is None or holdings.empty:
         return kpis
 
-    values = pd.to_numeric(holdings.get("Current Value USD"), errors="coerce").fillna(0)
+    values = pd.to_numeric(holdings.get("Current Value GBP"), errors="coerce").fillna(0)
     total = float(values.sum())
     kpis["total_value"] = total
 
@@ -331,12 +355,12 @@ def run_stress_test(holdings: pd.DataFrame,
     }
 
     df = holdings.copy()
-    df["Current Value USD"] = pd.to_numeric(df["Current Value USD"], errors="coerce").fillna(0)
-    grouped = df.groupby("Asset Class", sort=False)["Current Value USD"].sum().reset_index()
+    df["Current Value GBP"] = pd.to_numeric(df["Current Value GBP"], errors="coerce").fillna(0)
+    grouped = df.groupby("Asset Class", sort=False)["Current Value GBP"].sum().reset_index()
     grouped["Shock"] = grouped["Asset Class"].map(shock_map).fillna(0.0)
-    grouped["Stressed Value"] = grouped["Current Value USD"] * (1 + grouped["Shock"])
-    grouped["Change"] = grouped["Stressed Value"] - grouped["Current Value USD"]
-    return grouped.rename(columns={"Current Value USD": "Current Value"})[schema]
+    grouped["Stressed Value"] = grouped["Current Value GBP"] * (1 + grouped["Shock"])
+    grouped["Change"] = grouped["Stressed Value"] - grouped["Current Value GBP"]
+    return grouped.rename(columns={"Current Value GBP": "Current Value"})[schema]
 
 
 # ---------------------------------------------------------------------------
@@ -390,23 +414,24 @@ def build_risk_prompt(holdings: pd.DataFrame,
     macro_lines: list[str] = []
     for region, indicators in (macro or {}).items():
         for ind in indicators:
-            macro_lines.append(
-                f"- {region} {ind.get('name', '?')}: {ind.get('value', '?')} "
-                f"({ind.get('delta', 'n/a')})"
-            )
+            try:
+                value_str = f"{float(ind.get('value', 0)):.2f}%"
+            except (TypeError, ValueError):
+                value_str = str(ind.get("value", "?"))
+            macro_lines.append(f"- {region} {ind.get('name', '?')}: {value_str}")
     macro_block = "\n".join(macro_lines) or "(no macro data available)"
 
     return f"""You are a senior portfolio risk manager at a global asset manager.
 Analyze the client portfolio below in the context of the current macroeconomic
-rate environment.
+rate environment. All monetary values are in British Pounds (GBP, £).
 
 ## Portfolio holdings
 {holdings_block}
 
-Total portfolio value: ${kpis.get('total_value', 0):,.0f}
+Total portfolio value: £{kpis.get('total_value', 0):,.2f}
 Cash allocation: {kpis.get('cash_pct', 0):.1f}%
 
-## Current macro rates
+## Current macro rates (user-adjusted, live policy environment)
 {macro_block}
 
 ## Your task
@@ -480,8 +505,8 @@ def get_gemini_analysis(api_key: str, prompt: str) -> tuple[str, str]:
 
 def render_header() -> None:
     st.title("📊 AI Risk & Finance Dashboard")
-    st.caption("Tracking multi-platform wealth & macroeconomic exposure — "
-               "equities, fixed income, crypto and cash in one view.")
+    st.caption("Tracking multi-platform wealth & macroeconomic exposure in "
+               "GBP (£) — equities, fixed income, crypto and cash in one view.")
     st.divider()
 
 
@@ -490,8 +515,8 @@ def render_kpis(kpis: dict[str, float]) -> None:
     col1, col2, col3 = st.columns(3)
     col1.metric(
         "Total Portfolio Value",
-        f"${kpis['total_value']:,.0f}",
-        help="Aggregated across all connected platforms.",
+        f"£{kpis['total_value']:,.2f}",
+        help="Aggregated across all connected platforms, in GBP.",
     )
     col2.metric(
         "Cash Allocation",
@@ -500,38 +525,42 @@ def render_kpis(kpis: dict[str, float]) -> None:
     )
     col3.metric(
         "24h P&L",
-        f"${kpis['pnl_24h']:+,.0f}",
+        f"£{kpis['pnl_24h']:+,.2f}",
         delta=f"{kpis['pnl_24h_pct']:+.2f}%",
-        help="Units × (live price − previous close), summed over priced rows.",
+        help="Units × (live price − previous close) in GBP, summed over priced rows.",
     )
 
 
-def render_sidebar(macro: dict[str, list[dict[str, Any]]]) -> None:
-    """Sidebar with macroeconomic tracker rate cards, grouped by region."""
+def render_sidebar() -> dict[str, list[dict[str, Any]]]:
+    """Sidebar with editable macroeconomic trackers, grouped by region.
+
+    Each indicator is a number input seeded with the benchmark default and
+    adjustable at any time (persisted in session state). Returns the current
+    values as ``{region: [{"name": ..., "value": float}, ...]}`` so they can
+    be fed into the Gemini risk prompt.
+    """
+    macro: dict[str, list[dict[str, Any]]] = {}
+
     with st.sidebar:
         st.header("🌍 Macro Trackers")
-        st.caption("Placeholder values — wire to FRED / BoE / ECB feeds.")
+        st.caption("Benchmark policy rates & inflation — adjust anytime; the "
+                   "AI Risk Advisor uses your values.")
 
-        if not macro:
-            st.info("Macro data unavailable.")
-            return
-
-        for region, indicators in macro.items():
+        for region, indicators in MACRO_DEFAULTS.items():
             st.subheader(region)
+            current: list[dict[str, Any]] = []
             for ind in indicators:
-                direction = ind.get("direction", "flat")
-                delta_cls = {"up": "delta-up", "down": "delta-down"}.get(direction, "")
-                arrow = {"up": "▲", "down": "▼"}.get(direction, "•")
-                st.markdown(
-                    f"""
-                    <div class="macro-card">
-                        <div class="label">{ind.get("name", "—")}</div>
-                        <div class="value">{ind.get("value", "—")}</div>
-                        <div class="delta {delta_cls}">{arrow} {ind.get("delta", "")}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+                value = st.number_input(
+                    f"{ind['name']} (%)",
+                    min_value=-5.0,
+                    max_value=50.0,
+                    value=float(ind["value"]),
+                    step=0.05,
+                    format="%.2f",
+                    key=ind["key"],
                 )
+                current.append({"name": ind["name"], "value": float(value)})
+            macro[region] = current
 
         st.divider()
 
@@ -551,7 +580,9 @@ def render_sidebar(macro: dict[str, list[dict[str, Any]]]) -> None:
             )
 
         st.divider()
-        st.caption("Data refresh: every 5 min (cached) · All figures indicative.")
+        st.caption("Prices cached 60s · FX via GBPUSD=X · All figures indicative.")
+
+    return macro
 
 
 def render_holdings_editor() -> pd.DataFrame:
@@ -562,8 +593,8 @@ def render_holdings_editor() -> pd.DataFrame:
     """
     st.subheader("💼 Holdings")
     st.caption("Enter your positions below — prices are fetched live from "
-               "Yahoo Finance. Use ticker `CASH` (or asset class *Cash*) for "
-               "cash balances: 1 unit = $1.00.")
+               "Yahoo Finance and converted to GBP (£). Use ticker `CASH` "
+               "(or asset class *Cash*) for cash balances: 1 unit = £1.00.")
 
     if HOLDINGS_STATE_KEY not in st.session_state:
         st.session_state[HOLDINGS_STATE_KEY] = default_holdings_input()
@@ -591,7 +622,7 @@ def render_holdings_editor() -> pd.DataFrame:
                 "Asset Class", options=ASSET_CLASSES, required=True),
             "Units Owned": st.column_config.NumberColumn(
                 "Units Owned", min_value=0.0, format="%.4f",
-                help="Shares / coins held. For CASH rows: USD amount."),
+                help="Shares / coins held. For CASH rows: GBP amount."),
         },
     )
 
@@ -605,14 +636,19 @@ def render_holdings_values(holdings: pd.DataFrame) -> None:
         st.info("No holdings entered yet. Add rows above to begin.")
         return
 
+    if not get_usd_to_gbp()["ok"]:
+        st.warning("Live GBP/USD rate unavailable — using an approximate "
+                   f"fallback of {FALLBACK_USD_TO_GBP:.2f}. USD-quoted values "
+                   "may be slightly off.", icon="💱")
+
     failed = holdings.loc[~holdings["Price OK"].astype(bool), "Ticker"].tolist()
     if failed:
         st.warning(f"⚠️ Could not fetch prices for: {', '.join(failed)} — "
-                   "these rows are valued at $0.00. Check the ticker symbols.",
+                   "these rows are valued at £0.00. Check the ticker symbols.",
                    icon="⚠️")
 
     display = holdings[["Asset", "Ticker", "Platform", "Asset Class",
-                        "Units Owned", "Live Price", "Current Value USD",
+                        "Units Owned", "Live Price", "Current Value GBP",
                         "Allocation %"]]
     st.dataframe(
         display,
@@ -621,9 +657,9 @@ def render_holdings_values(holdings: pd.DataFrame) -> None:
         column_config={
             "Units Owned": st.column_config.NumberColumn(format="%.4f"),
             "Live Price": st.column_config.NumberColumn(
-                "Live Price", format="$%.2f"),
-            "Current Value USD": st.column_config.NumberColumn(
-                "Current Value (USD)", format="$%,.0f"),
+                "Live Price (£)", format="£%.2f"),
+            "Current Value GBP": st.column_config.NumberColumn(
+                "Current Value (£)", format="£%,.2f"),
             "Allocation %": st.column_config.ProgressColumn(
                 "Allocation %", format="%.1f%%", min_value=0, max_value=100),
         },
@@ -652,9 +688,9 @@ def render_stress_test(holdings: pd.DataFrame) -> None:
     change_pct = 100.0 * change / current_total if current_total else 0.0
 
     m1, m2 = st.columns(2)
-    m1.metric("Portfolio (stressed)", f"${stressed_total:,.0f}",
+    m1.metric("Portfolio (stressed)", f"£{stressed_total:,.2f}",
               delta=f"{change_pct:+.1f}%")
-    m2.metric("Impact", f"${change:+,.0f}")
+    m2.metric("Impact", f"£{change:+,.2f}")
 
     # Grouped bar: current vs stressed value by asset class
     fig = go.Figure(data=[
@@ -666,7 +702,7 @@ def render_stress_test(holdings: pd.DataFrame) -> None:
     fig.update_layout(
         barmode="group", height=300,
         margin=dict(l=10, r=10, t=10, b=10),
-        yaxis_title="Value (USD)", legend=dict(orientation="h", y=1.1),
+        yaxis_title="Value (£ GBP)", legend=dict(orientation="h", y=1.1),
     )
     st.plotly_chart(fig, width="stretch")
 
@@ -745,11 +781,10 @@ def render_ai_advisor(holdings: pd.DataFrame,
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    macro = get_macro_rates()
     alerts = get_ai_recommendations()
 
     render_header()
-    render_sidebar(macro)
+    macro = render_sidebar()  # editable macro rates, fed to the Gemini prompt
 
     # KPIs must appear above the holdings editor but depend on its edits, so
     # reserve the slot now and fill it after the editor has run this rerun.
