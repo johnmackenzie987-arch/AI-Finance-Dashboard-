@@ -367,10 +367,12 @@ def run_stress_test(holdings: pd.DataFrame,
 # 3. GEMINI INTEGRATION (AI Risk Advisor)
 # ---------------------------------------------------------------------------
 
-# Active Gemini endpoints, tried in order. A model is skipped (with a
-# user-visible warning) on 503 UNAVAILABLE, 404 NOT_FOUND, quota errors, or
-# any other API exception; the next model in the list is then attempted.
-MODELS_TO_TRY = ["gemini-3.7-flash", "gemini-3.1-pro-preview", "gemini-3.1-flash-lite"]
+# Active Gemini endpoints, tried in order. gemini-3.5-pro first (paid tier),
+# then cheaper/lighter fallbacks. A model is skipped (with a user-visible
+# warning) on 503 UNAVAILABLE, 404 NOT_FOUND, quota errors, or any other API
+# exception; the next model in the list is then attempted.
+MODELS_TO_TRY = ["gemini-3.5-pro", "gemini-3.7-flash",
+                 "gemini-3.1-pro-preview", "gemini-3.1-flash-lite"]
 
 
 def resolve_gemini_api_key() -> str:
