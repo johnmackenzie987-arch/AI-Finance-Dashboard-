@@ -23,6 +23,7 @@ is missing or malformed so the UI never crashes on incomplete inputs.
 from __future__ import annotations
 
 import os
+import time
 from typing import Any
 
 import pandas as pd
@@ -367,12 +368,20 @@ def run_stress_test(holdings: pd.DataFrame,
 # 3. GEMINI INTEGRATION (AI Risk Advisor)
 # ---------------------------------------------------------------------------
 
-# Active Gemini endpoints, tried in order. gemini-3.5-pro first (paid tier),
-# then cheaper/lighter fallbacks. A model is skipped (with a user-visible
-# warning) on 503 UNAVAILABLE, 404 NOT_FOUND, quota errors, or any other API
-# exception; the next model in the list is then attempted.
-MODELS_TO_TRY = ["gemini-3.5-pro", "gemini-3.7-flash",
-                 "gemini-3.1-pro-preview", "gemini-3.1-flash-lite"]
+# Active free-tier Gemini endpoints, tried in order by the self-healing
+# fallback loop. On 503 (high demand) or 429 (rate limit) the engine waits
+# 2 seconds before moving to the next model; any other API error skips ahead
+# immediately. The first model to respond wins.
+MODELS_TO_TRY = [
+    "gemini-2.5-flash",
+    "gemini-3.5-flash",
+    "gemini-3.7-flash",
+    "gemini-3.5-flash-lite",
+]
+
+# Errors that indicate transient load/quota pressure — worth a short pause
+# before hitting the next endpoint.
+RETRYABLE_MARKERS = ("503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED")
 
 
 def resolve_gemini_api_key() -> str:
@@ -457,22 +466,24 @@ and rates provided. Do not add any sections beyond the three above."""
 
 
 def get_gemini_analysis(api_key: str, prompt: str) -> tuple[str, str]:
-    """Call Gemini and return ``(analysis_text, error_message)``.
+    """Self-healing Gemini call. Returns ``(analysis_text, model_used, error)``.
 
-    Exactly one of the two is non-empty. Iterates ``MODELS_TO_TRY`` in order:
-    the first successful generation wins; each failure (503 UNAVAILABLE,
-    404 NOT_FOUND, quota exhaustion, or any other API exception) emits a
-    user-visible warning and falls through to the next model. Import is
-    deferred so the dashboard still runs when `google-genai` is not installed.
+    On success, ``analysis_text`` and ``model_used`` are set and ``error`` is
+    empty. Iterates ``MODELS_TO_TRY`` in order: the first successful
+    generation wins. On 503 (high demand) or 429 (rate limit) the loop sleeps
+    2 seconds before trying the next model; any other API exception moves on
+    immediately. If every model fails, ``error`` carries the combined
+    diagnostics. Import is deferred so the dashboard still runs when
+    `google-genai` is not installed.
     """
     if not api_key:
-        return "", "No API key provided."
+        return "", "", "No API key provided."
 
     try:
         from google import genai
     except ImportError:
-        return "", ("The `google-genai` package is not installed. "
-                    "Run `pip install -r requirements.txt` and restart the app.")
+        return "", "", ("The `google-genai` package is not installed. "
+                        "Run `pip install -r requirements.txt` and restart the app.")
 
     client = genai.Client(api_key=api_key.strip())
 
@@ -482,18 +493,23 @@ def get_gemini_analysis(api_key: str, prompt: str) -> tuple[str, str]:
             response = client.models.generate_content(model=model, contents=prompt)
             text = (response.text or "").strip()
             if text:
-                return text, ""  # success — caller renders the markdown
+                return text, model, ""  # success — caller renders the markdown
             raise RuntimeError("model returned an empty response")
-        except Exception as exc:  # 503 / 404 / quota / anything else
+        except Exception as exc:  # 503 / 429 / 404 / anything else
             failures.append(f"{model}: {exc}")
             next_model = (MODELS_TO_TRY[index + 1]
                           if index + 1 < len(MODELS_TO_TRY) else None)
             if next_model:
-                st.warning(f"`{model}` unavailable — trying `{next_model}`…",
-                           icon="🔀")
+                if any(marker in str(exc) for marker in RETRYABLE_MARKERS):
+                    st.warning(f"`{model}` under high demand / rate-limited — "
+                               f"retrying with `{next_model}` in 2s…", icon="⏳")
+                    time.sleep(2)
+                else:
+                    st.warning(f"`{model}` unavailable — trying `{next_model}`…",
+                               icon="🔀")
 
-    return "", ("Gemini API error — all models failed. "
-                + " | ".join(failures))
+    return "", "", ("Gemini API error — all models failed. "
+                    + " | ".join(failures))
 
 
 # ---------------------------------------------------------------------------
@@ -755,12 +771,14 @@ def render_ai_advisor(holdings: pd.DataFrame,
     if clicked:
         prompt = build_risk_prompt(holdings, kpis, macro)
         with st.spinner("Gemini is analyzing your portfolio and macro exposure…"):
-            analysis, error = get_gemini_analysis(api_key, prompt)
+            analysis, model_used, error = get_gemini_analysis(api_key, prompt)
         st.session_state["advisor_analysis"] = analysis
+        st.session_state["advisor_model"] = model_used
         st.session_state["advisor_error"] = error
 
     error = st.session_state.get("advisor_error", "")
     analysis = st.session_state.get("advisor_analysis", "")
+    model_used = st.session_state.get("advisor_model", "")
 
     if error:
         st.error(error, icon="⚠️")
@@ -770,6 +788,8 @@ def render_ai_advisor(holdings: pd.DataFrame,
                     '</div>', unsafe_allow_html=True)
         with st.container(border=True):
             st.markdown(analysis)
+        if model_used:
+            st.caption(f"Generated via {model_used}")
         st.caption("AI-generated analysis — informational only, not financial advice.")
 
 
