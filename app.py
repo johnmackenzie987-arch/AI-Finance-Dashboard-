@@ -8,7 +8,8 @@ macroeconomic exposure.
 Structure
 ---------
 1. Configuration & styling ......... page config + lightweight CSS polish
-2. Data layer ...................... mock data providers (swap for live APIs later)
+2. Data layer ...................... editable holdings input + yfinance live
+                                     price engine + portfolio math
 3. Gemini integration .............. API-key resolution, prompt building, and
                                      the google-genai client call
 4. UI components ................... reusable render functions (KPIs, sidebar,
@@ -99,35 +100,132 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
-# 2. DATA LAYER (mock providers — replace with live API calls later)
+# 2. DATA LAYER (user-editable holdings + live price engine)
 # ---------------------------------------------------------------------------
 
-@st.cache_data(ttl=300)
-def get_holdings() -> pd.DataFrame:
-    """Return the sample multi-platform portfolio.
+# The 5 fields the user enters directly; everything else is computed.
+INPUT_COLUMNS = ["Asset", "Ticker", "Platform", "Asset Class", "Units Owned"]
+ASSET_CLASSES = ["Equities", "Fixed Income", "Crypto", "Cash"]
+CASH_TICKER = "CASH"
+HOLDINGS_STATE_KEY = "holdings_input"
 
-    In production this would aggregate broker/exchange/bank APIs. Returns an
-    empty DataFrame with the expected schema if anything goes wrong, so
-    downstream renderers can rely on the columns existing.
+
+def default_holdings_input() -> pd.DataFrame:
+    """Seed portfolio for first load — Yahoo-Finance-valid, USD-denominated
+    tickers so live pricing works out of the box. Cash rows use units = USD.
     """
-    columns = ["Asset", "Ticker", "Platform", "Asset Class",
-               "Allocation %", "Current Value USD"]
+    rows = [
+        ("S&P 500 ETF",        "VOO",     "Vanguard",            "Equities",     120.0),
+        ("Nasdaq 100 ETF",     "QQQ",     "Interactive Brokers", "Equities",      80.0),
+        ("Apple",              "AAPL",    "Interactive Brokers", "Equities",      50.0),
+        ("US Treasury 1-3Y",   "SHY",     "Fidelity",            "Fixed Income", 400.0),
+        ("Corp IG Bond Fund",  "LQD",     "Fidelity",            "Fixed Income", 250.0),
+        ("Bitcoin",            "BTC-USD", "Coinbase",            "Crypto",         0.5),
+        ("Ethereum",           "ETH-USD", "Kraken",              "Crypto",         4.0),
+        ("USD Cash",           "CASH",    "Vanguard",            "Cash",       40_000.0),
+    ]
+    return pd.DataFrame(rows, columns=INPUT_COLUMNS)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_live_price(ticker: str) -> dict[str, Any]:
+    """Fetch the live price (and previous close) for one ticker via yfinance.
+
+    Returns ``{"price": float, "prev_close": float, "ok": bool}``. Cached for
+    60s so table edits and reruns stay fast. Any failure (bad ticker, network
+    down, delisted symbol) degrades to price 0.0 with ``ok=False`` — callers
+    flag the row instead of crashing.
+    """
+    result = {"price": 0.0, "prev_close": 0.0, "ok": False}
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        return result
+
     try:
-        rows = [
-            ("S&P 500 ETF",           "VOO",     "Vanguard",         "Equities",     28.0, 140_000),
-            ("Nasdaq 100 ETF",        "QQQ",     "Interactive Brokers", "Equities",  15.0,  75_000),
-            ("MSCI World ex-US",      "VEU",     "Vanguard",         "Equities",      7.0,  35_000),
-            ("US Treasury 2Y Ladder", "SHY",     "Fidelity",         "Fixed Income", 14.0,  70_000),
-            ("UK Gilts ETF",          "IGLT.L",  "Hargreaves Lansdown", "Fixed Income", 6.0, 30_000),
-            ("Corp IG Bond Fund",     "LQD",     "Fidelity",         "Fixed Income",  6.0,  30_000),
-            ("Bitcoin",               "BTC",     "Coinbase",         "Crypto",        8.0,  40_000),
-            ("Ethereum",              "ETH",     "Kraken",           "Crypto",        4.0,  20_000),
-            ("USD Money Market",      "VMFXX",   "Vanguard",         "Cash",          8.0,  40_000),
-            ("GBP Instant Access",    "—",       "Barclays",         "Cash",          4.0,  20_000),
-        ]
-        return pd.DataFrame(rows, columns=columns)
+        import yfinance as yf
+
+        asset = yf.Ticker(ticker)
+        price = prev_close = 0.0
+
+        # Fast path: fast_info avoids a full history download.
+        try:
+            fast = asset.fast_info
+            price = float(fast["last_price"] or 0.0)
+            prev_close = float(fast["previous_close"] or 0.0)
+        except Exception:
+            pass
+
+        # Fallback: latest daily closes (also fills a missing prev_close).
+        if price <= 0 or price != price or prev_close <= 0:
+            closes = asset.history(period="5d")["Close"].dropna()
+            if not closes.empty:
+                if price <= 0 or price != price:
+                    price = float(closes.iloc[-1])
+                if prev_close <= 0 and len(closes) > 1:
+                    prev_close = float(closes.iloc[-2])
+
+        if price > 0:
+            result.update(price=price,
+                          prev_close=prev_close if prev_close > 0 else price,
+                          ok=True)
     except Exception:
-        return pd.DataFrame(columns=columns)
+        pass  # keep the safe default
+
+    return result
+
+
+def is_cash_row(ticker: str, asset_class: str) -> bool:
+    """Cash rows are priced at a locked $1.00 (units == USD)."""
+    return (str(ticker).strip().upper() == CASH_TICKER
+            or str(asset_class).strip() == "Cash")
+
+
+def enrich_holdings(input_df: pd.DataFrame) -> pd.DataFrame:
+    """Turn the 5-column user input into a fully-priced holdings table.
+
+    Adds: Live Price, Current Value USD (= units × price), Allocation %, and
+    a Price OK flag for rows whose ticker failed to price. Blank rows (added
+    but not yet filled in the editor) are dropped. Never raises.
+    """
+    computed_cols = INPUT_COLUMNS + ["Live Price", "Current Value USD",
+                                     "Allocation %", "Price OK"]
+    if input_df is None or input_df.empty:
+        return pd.DataFrame(columns=computed_cols)
+
+    df = input_df.copy()
+    for col in INPUT_COLUMNS:
+        if col not in df.columns:
+            df[col] = None
+
+    df["Units Owned"] = pd.to_numeric(df["Units Owned"], errors="coerce").fillna(0.0)
+    for col in ("Asset", "Ticker", "Platform", "Asset Class"):
+        df[col] = df[col].fillna("").astype(str).str.strip()
+
+    # Drop rows the user added in the editor but hasn't filled in yet.
+    df = df[(df["Ticker"] != "") | (df["Asset"] != "")].reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame(columns=computed_cols)
+
+    prices, prev_closes, ok_flags = [], [], []
+    for _, row in df.iterrows():
+        if is_cash_row(row["Ticker"], row["Asset Class"]):
+            prices.append(1.0)
+            prev_closes.append(1.0)
+            ok_flags.append(True)
+        else:
+            quote = fetch_live_price(row["Ticker"])
+            prices.append(quote["price"])
+            prev_closes.append(quote["prev_close"])
+            ok_flags.append(quote["ok"])
+
+    df["Live Price"] = prices
+    df["Prev Close"] = prev_closes
+    df["Price OK"] = ok_flags
+    df["Current Value USD"] = df["Units Owned"] * df["Live Price"]
+
+    total = float(df["Current Value USD"].sum())
+    df["Allocation %"] = (100.0 * df["Current Value USD"] / total) if total > 0 else 0.0
+    return df
 
 
 @st.cache_data(ttl=300)
@@ -179,7 +277,11 @@ def get_ai_recommendations() -> list[dict[str, str]]:
 # --- Portfolio math helpers -------------------------------------------------
 
 def compute_kpis(holdings: pd.DataFrame) -> dict[str, float]:
-    """Derive headline KPIs from holdings; safe against empty/missing data."""
+    """Derive headline KPIs from enriched holdings; safe against missing data.
+
+    24h P&L is computed from real price deltas: units × (live price − previous
+    close), summed over rows that priced successfully.
+    """
     kpis = {"total_value": 0.0, "cash_pct": 0.0, "pnl_24h": 0.0, "pnl_24h_pct": 0.0}
     if holdings is None or holdings.empty:
         return kpis
@@ -192,9 +294,15 @@ def compute_kpis(holdings: pd.DataFrame) -> dict[str, float]:
         cash_value = float(values[holdings["Asset Class"] == "Cash"].sum())
         kpis["cash_pct"] = 100.0 * cash_value / total
 
-    # Mock 24h P&L (would come from position-level price deltas in production)
-    kpis["pnl_24h"] = 3_240.0
-    kpis["pnl_24h_pct"] = 100.0 * kpis["pnl_24h"] / total if total else 0.0
+    if {"Units Owned", "Live Price", "Prev Close", "Price OK"}.issubset(holdings.columns):
+        priced = holdings[holdings["Price OK"].astype(bool)]
+        units = pd.to_numeric(priced["Units Owned"], errors="coerce").fillna(0)
+        live = pd.to_numeric(priced["Live Price"], errors="coerce").fillna(0)
+        prev = pd.to_numeric(priced["Prev Close"], errors="coerce").fillna(0)
+        kpis["pnl_24h"] = float((units * (live - prev)).sum())
+
+    prev_total = total - kpis["pnl_24h"]
+    kpis["pnl_24h_pct"] = 100.0 * kpis["pnl_24h"] / prev_total if prev_total else 0.0
     return kpis
 
 
@@ -394,7 +502,7 @@ def render_kpis(kpis: dict[str, float]) -> None:
         "24h P&L",
         f"${kpis['pnl_24h']:+,.0f}",
         delta=f"{kpis['pnl_24h_pct']:+.2f}%",
-        help="Mark-to-market change over the past 24 hours (mock).",
+        help="Units × (live price − previous close), summed over priced rows.",
     )
 
 
@@ -446,24 +554,78 @@ def render_sidebar(macro: dict[str, list[dict[str, Any]]]) -> None:
         st.caption("Data refresh: every 5 min (cached) · All figures indicative.")
 
 
-def render_holdings(holdings: pd.DataFrame) -> None:
-    """Holdings table with formatted currency/percentage columns."""
+def render_holdings_editor() -> pd.DataFrame:
+    """Editable 5-column holdings input backed by session state.
+
+    Users enter Asset, Ticker, Platform, Asset Class and Units Owned; rows can
+    be added/deleted directly in the grid. Returns the edited input DataFrame.
+    """
     st.subheader("💼 Holdings")
+    st.caption("Enter your positions below — prices are fetched live from "
+               "Yahoo Finance. Use ticker `CASH` (or asset class *Cash*) for "
+               "cash balances: 1 unit = $1.00.")
+
+    if HOLDINGS_STATE_KEY not in st.session_state:
+        st.session_state[HOLDINGS_STATE_KEY] = default_holdings_input()
+
+    if st.button("🔄 Refresh Market Prices",
+                 help="Clears the 60s price cache and refetches all tickers."):
+        fetch_live_price.clear()
+
+    edited = st.data_editor(
+        st.session_state[HOLDINGS_STATE_KEY],
+        num_rows="dynamic",          # allow adding/deleting rows in the UI
+        width="stretch",
+        hide_index=True,
+        key="holdings_editor",
+        column_config={
+            "Asset": st.column_config.TextColumn(
+                "Asset Name", help="e.g. Apple, S&P 500, Bitcoin, Cash",
+                required=True),
+            "Ticker": st.column_config.TextColumn(
+                "Ticker / Symbol", help="Yahoo Finance symbol, e.g. AAPL, "
+                "VOO, BTC-USD — or CASH for cash", required=True),
+            "Platform": st.column_config.TextColumn(
+                "Platform", help="e.g. Vanguard, IBKR, Fidelity"),
+            "Asset Class": st.column_config.SelectboxColumn(
+                "Asset Class", options=ASSET_CLASSES, required=True),
+            "Units Owned": st.column_config.NumberColumn(
+                "Units Owned", min_value=0.0, format="%.4f",
+                help="Shares / coins held. For CASH rows: USD amount."),
+        },
+    )
+
+    st.session_state[HOLDINGS_STATE_KEY] = edited
+    return edited
+
+
+def render_holdings_values(holdings: pd.DataFrame) -> None:
+    """Read-only computed view: live prices, market values and allocations."""
     if holdings is None or holdings.empty:
-        st.info("No holdings data available. Connect a platform to begin.")
+        st.info("No holdings entered yet. Add rows above to begin.")
         return
 
+    failed = holdings.loc[~holdings["Price OK"].astype(bool), "Ticker"].tolist()
+    if failed:
+        st.warning(f"⚠️ Could not fetch prices for: {', '.join(failed)} — "
+                   "these rows are valued at $0.00. Check the ticker symbols.",
+                   icon="⚠️")
+
+    display = holdings[["Asset", "Ticker", "Platform", "Asset Class",
+                        "Units Owned", "Live Price", "Current Value USD",
+                        "Allocation %"]]
     st.dataframe(
-        holdings,
+        display,
         width="stretch",
         hide_index=True,
         column_config={
-            "Allocation %": st.column_config.ProgressColumn(
-                "Allocation %", format="%.1f%%", min_value=0, max_value=100,
-            ),
+            "Units Owned": st.column_config.NumberColumn(format="%.4f"),
+            "Live Price": st.column_config.NumberColumn(
+                "Live Price", format="$%.2f"),
             "Current Value USD": st.column_config.NumberColumn(
-                "Current Value (USD)", format="$%,.0f",
-            ),
+                "Current Value (USD)", format="$%,.0f"),
+            "Allocation %": st.column_config.ProgressColumn(
+                "Allocation %", format="%.1f%%", min_value=0, max_value=100),
         },
     )
 
@@ -583,17 +745,24 @@ def render_ai_advisor(holdings: pd.DataFrame,
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    holdings = get_holdings()
     macro = get_macro_rates()
     alerts = get_ai_recommendations()
-    kpis = compute_kpis(holdings)
 
     render_header()
     render_sidebar(macro)
-    render_kpis(kpis)
+
+    # KPIs must appear above the holdings editor but depend on its edits, so
+    # reserve the slot now and fill it after the editor has run this rerun.
+    kpi_slot = st.container()
     st.divider()
 
-    render_holdings(holdings)
+    input_df = render_holdings_editor()
+    with st.spinner("Fetching live market prices…"):
+        holdings = enrich_holdings(input_df)
+    render_holdings_values(holdings)
+    kpis = compute_kpis(holdings)
+    with kpi_slot:
+        render_kpis(kpis)
     st.divider()
 
     # Stress test and AI feed side by side
